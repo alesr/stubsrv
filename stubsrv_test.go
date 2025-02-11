@@ -1,16 +1,59 @@
 package stubsrv
 
 import (
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestExampleStub(t *testing.T) {
+	t.Parallel()
+
+	stub := NewStub(noopLogger())
+
+	// add GET route
+	stub.AddHandler(http.MethodGet, "/foo", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("Foo"))
+	})
+
+	// add POST route
+	stub.AddHandler(http.MethodPost, "/echo", func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		_, _ = w.Write(bodyBytes)
+	})
+
+	stub.Start()
+	defer stub.Close()
+
+	// call endpoints
+
+	respGet, err := http.Get(stub.URL() + "/foo")
+	require.NoError(t, err)
+
+	defer respGet.Body.Close()
+	bodyGet, _ := io.ReadAll(respGet.Body)
+	fmt.Println(string(bodyGet))
+
+	respPost, err := http.Post(stub.URL()+"/echo", "text/plain", strings.NewReader("Bar"))
+	require.NoError(t, err)
+
+	defer respPost.Body.Close()
+	bodyPost, _ := io.ReadAll(respPost.Body)
+	fmt.Println(string(bodyPost))
+
+	// Output:
+	// Foo
+	// Bar
+}
 
 func TestStub_New(t *testing.T) {
 	t.Parallel()
