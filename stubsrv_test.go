@@ -67,11 +67,7 @@ func TestStub_New(t *testing.T) {
 		assert.Nil(t, got.Server)
 		assert.False(t, got.closed)
 
-		assert.Len(t, got.routers, 1)
-		route, exists := got.routers["GET /readyz"]
-		assert.True(t, exists)
-		assert.NotNil(t, route.handler)
-		assert.Empty(t, route.middlewares)
+		assert.Len(t, got.routers, 0)
 	})
 }
 
@@ -87,7 +83,7 @@ func TestStub_AddHandler(t *testing.T) {
 
 		stub.AddHandler("GET", "/test", handlerFn)
 
-		assert.Len(t, stub.routers, 2) // we already have a built-in readyz endpoint
+		assert.Len(t, stub.routers, 1) // only the newly added route
 		route, exists := stub.routers["GET /test"]
 		assert.True(t, exists)
 		assert.NotNil(t, route.handler)
@@ -109,7 +105,7 @@ func TestStub_AddHandler(t *testing.T) {
 
 		stub.AddHandler("POST", "/test-with-middleware", handlerFn, middleware)
 
-		assert.Len(t, stub.routers, 2)
+		assert.Len(t, stub.routers, 1)
 		route, exists := stub.routers["POST /test-with-middleware"]
 		assert.True(t, exists)
 
@@ -125,7 +121,7 @@ func TestStub_AddHandler(t *testing.T) {
 
 		stub.AddHandler("get", "/foo", handlerFn)
 
-		assert.Len(t, stub.routers, 2)
+		assert.Len(t, stub.routers, 1)
 		_, exists := stub.routers["GET /foo"]
 		assert.True(t, exists)
 	})
@@ -141,7 +137,7 @@ func TestStub_AddHandler(t *testing.T) {
 		stub.AddHandler("POST", "/second", handlerFn)
 		stub.AddHandler("put", "/third", handlerFn)
 
-		assert.Len(t, stub.routers, 4)
+		assert.Len(t, stub.routers, 3)
 		_, exists1 := stub.routers["GET /first"]
 		_, exists2 := stub.routers["POST /second"]
 		_, exists3 := stub.routers["PUT /third"]
@@ -150,19 +146,24 @@ func TestStub_AddHandler(t *testing.T) {
 		assert.True(t, exists3)
 	})
 
-	t.Run("panics when adding handler after server has started", func(t *testing.T) {
+	t.Run("successfully adds handler after server has started", func(t *testing.T) {
 		t.Parallel()
 
 		stub := NewStub(noopLogger())
+		require.NoError(t, stub.Start())
+		defer stub.Close()
 
-		handlerFn := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
+		handlerFn := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusTeapot)
+		})
 
-		stub.Server = httptest.NewServer(http.NewServeMux())
-		defer stub.Server.Close()
-
-		assert.Panics(t, func() {
+		assert.NotPanics(t, func() {
 			stub.AddHandler("GET", "/after-start", handlerFn)
 		})
+
+		resp, err := http.Get(stub.URL() + "/after-start")
+		assert.NoError(t, err)
+		assert.Equal(t, http.StatusTeapot, resp.StatusCode)
 	})
 }
 
@@ -172,7 +173,7 @@ func TestStub_Start(t *testing.T) {
 	t.Run("starts server successfully with dynamic port", func(t *testing.T) {
 		t.Parallel()
 
-		stub := NewStub(noopLogger())
+		stub := NewStub(noopLogger(), WithPort("0"))
 		var handlerCalled bool
 
 		stub.AddHandler(http.MethodGet, "/test", func(w http.ResponseWriter, r *http.Request) {
@@ -188,6 +189,11 @@ func TestStub_Start(t *testing.T) {
 		assert.NotNil(t, stub.mux)
 		assert.NotEmpty(t, stub.baseURL)
 
+		parsedURL, err := url.Parse(stub.baseURL)
+		require.NoError(t, err)
+		assert.NotEqual(t, "0", parsedURL.Port())
+		assert.NotEqual(t, defaultPort, parsedURL.Port())
+
 		resp, err := http.Get(stub.baseURL + "/test")
 		assert.NoError(t, err)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
@@ -197,13 +203,13 @@ func TestStub_Start(t *testing.T) {
 	t.Run("starts server with specific port", func(t *testing.T) {
 		t.Parallel()
 
-		stub := NewStub(noopLogger())
+		stub := NewStub(noopLogger(), WithPort("1234"))
 
 		stub.AddHandler(http.MethodGet, "/test", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 		})
 
-		err := stub.Start(WithPort("8008"))
+		err := stub.Start()
 		defer stub.Server.Close()
 
 		assert.NoError(t, err)
@@ -211,7 +217,7 @@ func TestStub_Start(t *testing.T) {
 
 		parsedURL, err := url.Parse(stub.baseURL)
 		assert.NoError(t, err)
-		assert.Equal(t, "8008", parsedURL.Port())
+		assert.Equal(t, "1234", parsedURL.Port())
 
 		resp, err := http.Get(stub.baseURL + "/test")
 		assert.NoError(t, err)
@@ -248,13 +254,13 @@ func TestStub_Start(t *testing.T) {
 		const testPort = "12345"
 		logger := noopLogger()
 
-		firstStub := NewStub(noopLogger())
-		err := firstStub.Start(WithPort(testPort))
+		firstStub := NewStub(noopLogger(), WithPort(testPort))
+		err := firstStub.Start()
 		require.NoError(t, err)
 		defer firstStub.Server.Close()
 
-		secondStub := NewStub(logger)
-		err = secondStub.Start(WithPort(testPort)) // same port
+		secondStub := NewStub(logger, WithPort(testPort))
+		err = secondStub.Start() // same port
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "could not listen")
 
@@ -420,143 +426,106 @@ func TestStub_URL(t *testing.T) {
 	})
 }
 
-func TestChainMiddleware(t *testing.T) {
+func TestStub_ControlAddHandler(t *testing.T) {
 	t.Parallel()
 
-	t.Run("no middleware", func(t *testing.T) {
-		t.Parallel()
+	stub := NewStub(noopLogger())
+	require.NoError(t, stub.Start())
+	defer stub.Close()
 
-		var handlerCalled bool
-		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			handlerCalled = true
-		})
+	// prepare control-plane payload
+	payload := `{
+		"method": "GET",
+		"path": "/dynamic",
+		"status": 201,
+		"body": "created",
+		"headers": { "Content-Type": "text/plain" }
+	}`
 
-		chained := chainMiddleware(handler)
+	resp, err := http.Post(stub.URL()+"/_control/handlers", "application/json", strings.NewReader(payload))
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusCreated, resp.StatusCode)
 
-		w := httptest.NewRecorder()
-		r := httptest.NewRequest(http.MethodGet, "/", nil)
-		chained.ServeHTTP(w, r)
+	// verify the dynamic route now exists and responds as configured
+	dynResp, err := http.Get(stub.URL() + "/dynamic")
+	require.NoError(t, err)
+	defer dynResp.Body.Close()
+	bodyBytes, _ := io.ReadAll(dynResp.Body)
 
-		assert.True(t, handlerCalled)
+	assert.Equal(t, http.StatusCreated, dynResp.StatusCode)
+	assert.Equal(t, "created", string(bodyBytes))
+	assert.Equal(t, "text/plain", dynResp.Header.Get("Content-Type"))
+}
+
+func TestStub_Dispatch(t *testing.T) {
+	t.Parallel()
+
+	stub := NewStub(noopLogger())
+	stub.AddHandler(http.MethodGet, "/foo", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
 	})
 
-	t.Run("single middleware", func(t *testing.T) {
-		t.Parallel()
+	// exact match
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/foo", nil)
+	stub.dispatch(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
 
-		var handlerCalled, middlewareCalled bool
-		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			handlerCalled = true
-		})
+	// path exists but wrong method
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/foo", nil)
+	stub.dispatch(w, req)
+	assert.Equal(t, http.StatusMethodNotAllowed, w.Code)
 
-		middleware := func(next http.Handler) http.Handler {
-			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				middlewareCalled = true
-				next.ServeHTTP(w, r)
-			})
-		}
+	// unknown path
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/unknown", nil)
+	stub.dispatch(w, req)
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
 
-		chained := chainMiddleware(handler, middleware)
+func TestStub_TemplateRouteMatching(t *testing.T) {
+	t.Parallel()
 
-		w := httptest.NewRecorder()
-		r := httptest.NewRequest(http.MethodGet, "/", nil)
-		chained.ServeHTTP(w, r)
+	stub := NewStub(noopLogger())
+	require.NoError(t, stub.Start())
+	defer stub.Close()
 
-		assert.True(t, handlerCalled)
-		assert.True(t, middlewareCalled)
-	})
+	// Register template route (with query constraint) via control endpoint.
+	payload := `{
+		"method": "GET",
+		"path": "/users/:id/orders/:orderId",
+		"query": { "status": "shipped" },
+		"status": 200,
+		"body": "matched"
+	}`
+	respCtl, err := http.Post(stub.URL()+"/_control/handlers", "application/json", strings.NewReader(payload))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusCreated, respCtl.StatusCode)
 
-	t.Run("multiple middleware in correct order", func(t *testing.T) {
-		t.Parallel()
+	base := stub.URL() + "/users/42/orders/24"
 
-		var execOrder []string
-		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			execOrder = append(execOrder, "handler")
-		})
+	// 1) Correct method, path and query → 200
+	okURL := base + "?status=shipped"
+	resp, err := http.Get(okURL)
+	require.NoError(t, err)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
 
-		middleware1 := func(next http.Handler) http.Handler {
-			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				execOrder = append(execOrder, "middleware1-before")
-				next.ServeHTTP(w, r)
-				execOrder = append(execOrder, "middleware1-after")
-			})
-		}
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "matched", string(body))
 
-		middleware2 := func(next http.Handler) http.Handler {
-			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				execOrder = append(execOrder, "middleware2-before")
-				next.ServeHTTP(w, r)
-				execOrder = append(execOrder, "middleware2-after")
-			})
-		}
+	// 2) Wrong query value → 404
+	badQueryURL := base + "?status=pending"
+	resp2, err := http.Get(badQueryURL)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusNotFound, resp2.StatusCode)
 
-		chained := chainMiddleware(handler, middleware1, middleware2)
-
-		w := httptest.NewRecorder()
-		r := httptest.NewRequest(http.MethodGet, "/", nil)
-		chained.ServeHTTP(w, r)
-
-		expected := []string{
-			"middleware1-before",
-			"middleware2-before",
-			"handler",
-			"middleware2-after",
-			"middleware1-after",
-		}
-		assert.Equal(t, expected, execOrder)
-	})
-
-	t.Run("middleware can modify request and response", func(t *testing.T) {
-		t.Parallel()
-
-		var handlerReceivedHeader string
-		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			handlerReceivedHeader = r.Header.Get("X-Test")
-			w.Header().Set("X-Response", "original")
-			w.WriteHeader(http.StatusOK)
-		})
-
-		modifyingMiddleware := func(next http.Handler) http.Handler {
-			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				r.Header.Set("X-Test", "modified")
-				next.ServeHTTP(w, r)
-				w.Header().Set("X-Response", "modified")
-			})
-		}
-
-		chained := chainMiddleware(handler, modifyingMiddleware)
-
-		w := httptest.NewRecorder()
-		r := httptest.NewRequest(http.MethodGet, "/", nil)
-		chained.ServeHTTP(w, r)
-
-		assert.Equal(t, "modified", handlerReceivedHeader)
-		assert.Equal(t, "modified", w.Header().Get("X-Response"))
-	})
-
-	t.Run("middleware can short-circuit handler execution", func(t *testing.T) {
-		t.Parallel()
-
-		var handlerCalled bool
-		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			handlerCalled = true
-		})
-
-		shortCircuitingMiddleware := func(next http.Handler) http.Handler {
-			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(http.StatusUnauthorized)
-				// not calling next.ServeHTTP intentionally
-			})
-		}
-
-		chained := chainMiddleware(handler, shortCircuitingMiddleware)
-
-		w := httptest.NewRecorder()
-		r := httptest.NewRequest(http.MethodGet, "/", nil)
-		chained.ServeHTTP(w, r)
-
-		assert.False(t, handlerCalled)
-		assert.Equal(t, http.StatusUnauthorized, w.Code)
-	})
+	// 3) Correct path/query but wrong method → 405
+	reqPost, _ := http.NewRequest(http.MethodPost, okURL, nil)
+	resp3, err := http.DefaultClient.Do(reqPost)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusMethodNotAllowed, resp3.StatusCode)
 }
 
 func noopLogger() *slog.Logger {
